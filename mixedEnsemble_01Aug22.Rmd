@@ -1,0 +1,347 @@
+---
+title: "MixedEnsemble - Parallel, Custom HPs for GitHub publication"
+author: "Dawn Dunbar"
+date: "14/01/2022"
+output: pdf_document
+---
+
+load("~/Data/FCoV_data/dry_dataset_repo/dry_dataset_repo/dry_mixEnsemble_22mar22.RData") gives same results as paper
+
+```{r load_packages, echo=FALSE, error=FALSE, message=FALSE, warning=FALSE, results='asis', include = FALSE, fig.height=7, fig.width=10, fig.align="center"}
+
+# Packages required for modelling
+
+library(tidyverse)
+library(knitr)
+library(magrittr)
+library(caret)
+library(caretEnsemble)
+library(gbm)
+library(e1071)
+library(kernlab)
+library(randomForest)
+library(devtools)
+library(parallel)
+library(foreach)
+library(iterators)
+library(doParallel)
+library(caretEnsemble)
+library(shapr)
+library(fastDummies)
+library(future)
+library(furrr)
+
+```
+
+```{r confirmed_cases, echo=FALSE, error=FALSE, message=FALSE, include = FALSE, warning=FALSE, results='asis', fig.height=7, fig.width=10, fig.align="center"}
+
+# Load the raw data from the confirmed cases
+confirmedData <- read_delim("publicationDataConf_27jun22.txt", col_names = T, delim = "\t")
+# Rename to confirmedCases so that original data is kept intact if required
+confirmedCases <- confirmedData
+
+#### Prepare the Sex and Pedigree columns, as imported they are still in original format ####
+
+# Prep data to make dummy columns
+dummytrial <- as.data.frame(confirmedCases[, 'SEX'])
+dummytrial$SEX <- gsub("\\?", "UNK", dummytrial$SEX)
+dummytrial$SEX <- as.factor(dummytrial$SEX)
+dummytrial$SEX <- fct_collapse(dummytrial$SEX, M = c("M", "MN"), Fe = c("F", "FN"), UNK = c("UNK", NA))
+
+# Create dummy columns
+dummytrial <- dummy_cols(dummytrial, remove_first_dummy = T)
+dummy_sexvars <- as.data.frame(dummytrial['SEX_M'])
+# removed the sex, breed and age for the moment
+confirmedCases <- confirmedCases[,!grepl("SEX",colnames(confirmedCases))] 
+confirmedCases <- cbind(confirmedCases, dummy_sexvars)
+names(confirmedCases)[names(confirmedCases) == "SEX_M"] <- "Male"
+
+specbred_trial <- as.data.frame(confirmedCases['specbred'])
+specbred_trial <- specbred_trial %>% mutate(BREED = ifelse(grepl("0_56_0|0_98_0|2_0_0|2_0_99|2_56_99|2_7_0|2_8_0", specbred_trial$specbred), "NON_PED", "PED"))
+
+specbred_trial <- dummy_cols(specbred_trial, select_columns = "BREED", remove_first_dummy = T)
+specbred_trial <- as.data.frame(specbred_trial['BREED_PED'])
+confirmedCases <- confirmedCases[,!grepl("specbred",colnames(confirmedCases))] 
+confirmedCases <- cbind(confirmedCases, specbred_trial)
+
+names(confirmedCases)[names(confirmedCases) == 'BREED_PED'] <- "Pedigree"
+# Change format of the dummy variables to numeric for modelling 
+confirmedCases[, c("Male", "Pedigree")] <- lapply(confirmedCases[, c("Male", "Pedigree")], as.numeric)
+
+confirmedCases <- confirmedCases[complete.cases(confirmedCases),]
+# Tidy up workspace, remove extra working data from dummy variable creation
+rm(dummy_sexvars, dummytrial, specbred_trial)
+
+# Prepare the final test data to evaluate the model
+confirmedCases['outcome_prediction'] <- lapply(confirmedCases['outcome_prediction'], factor)
+
+# Prepare the confirmed case data for modelling
+confirmedCasesEns <- as.data.frame(select(confirmedCases, -outcome_prediction))
+levels(confirmedCases$outcome_prediction)[levels(confirmedCases$outcome_prediction)=="0"] <- "NonFIP"
+levels(confirmedCases$outcome_prediction)[levels(confirmedCases$outcome_prediction)=="1"] <- "FIP"
+
+```
+
+```{r load_data, eval = TRUE, echo=FALSE, error=FALSE, message=FALSE, warning=FALSE, include = FALSE, results='asis', fig.height=7, fig.width=10, fig.align="center"}
+
+# Load raw data into project
+alldryCaseschecked <- read_delim("publicationData_27jun22.txt", col_names = T, delim = "\t")
+# Check for duplication of cases between the confirmedCases and remaining raw data
+alldryCaseschecked <- filter(alldryCaseschecked, !(alldryCaseschecked$LAB_REF_1 %in% confirmedCases$LAB_REF_1)) 
+alldryCases <- alldryCaseschecked
+
+
+```
+
+```{r create_partitions, echo=FALSE, error=FALSE, include = FALSE, message=FALSE, warning=FALSE, results='asis', fig.height=7, fig.width=10, fig.align="center"}
+
+set.seed(100)
+# Create data partition for final assessment of the ensemble
+alldry_finaltest <- createDataPartition(y=alldryCases$outcome_prediction, times = 1, p=0.2, list = T) 
+alldry_finaltest <- filter(alldryCases, row_number() %in% alldry_finaltest$Resample1)
+
+# Create data partition for training of the ensemble - filter final test from all cases
+alldry_training <- filter(alldryCases,  !(LAB_REF_1 %in% alldry_finaltest$LAB_REF_1)) 
+
+set.seed(200)
+# Create a 50% partition in remaining cases, half for training, half for validation
+alldry_validation <- createDataPartition(y=alldry_training$outcome_prediction, times = 1, p=0.5, list = T)
+# Filter validation partition from the training data
+alldry_validation <- filter(alldry_training, row_number() %in% alldry_validation$Resample1)
+# Filter out the validation partition from the training data
+alldry_training <- filter(alldry_training, !(LAB_REF_1 %in% alldry_validation$LAB_REF_1))
+
+# Create copies of the partitions for comparison and interrogation later (subsequent actions on the partitions removes some information not relevant for modelling)
+alldry_validation_comp <- alldry_validation
+alldry_finaltest_comp <- alldry_finaltest
+alldry_training_comp <- alldry_training
+
+```
+
+```{r prep_data, echo=FALSE, error=FALSE, include = FALSE, message=FALSE, warning=FALSE, results='asis', fig.height=7, fig.width=10, fig.align="center"}
+
+# Select relevant variables for modelling from the data partitions
+alldry_training <- select(alldry_training, c(FCoV_Abs_blood, AGP_blood, hb, neutrophils, lymphocytes, monocytes, eosinophils, albumin, albumin_globulin_ratio, YEARS,  Male, Pedigree, outcome_prediction))
+
+alldry_validation <- select(alldry_validation, c(FCoV_Abs_blood, AGP_blood, hb, neutrophils, lymphocytes, monocytes, eosinophils, albumin, albumin_globulin_ratio, YEARS,  Male, Pedigree, outcome_prediction))
+
+alldry_finaltest <- select(alldry_finaltest, c(FCoV_Abs_blood, AGP_blood, hb, neutrophils, lymphocytes, monocytes, eosinophils, albumin, albumin_globulin_ratio, YEARS,  Male, Pedigree, outcome_prediction))
+
+# Change the outcome variable for each partition to be factor rather than numeric
+alldry_training$outcome_prediction <- as.factor(alldry_training$outcome_prediction)
+alldry_validation$outcome_prediction <- as.factor(alldry_validation$outcome_prediction)
+alldry_finaltest$outcome_prediction <- as.factor(alldry_finaltest$outcome_prediction)
+
+# Adjust the levels of the outcome factor for each partition
+levels(alldry_training$outcome_prediction)[levels(alldry_training$outcome_prediction)=="0"] <- "NonFIP"
+levels(alldry_training$outcome_prediction)[levels(alldry_training$outcome_prediction)=="1"] <- "FIP"
+
+levels(alldry_validation$outcome_prediction)[levels(alldry_validation$outcome_prediction)=="0"] <- "NonFIP"
+levels(alldry_validation$outcome_prediction)[levels(alldry_validation$outcome_prediction)=="1"] <- "FIP"
+
+levels(alldry_finaltest$outcome_prediction)[levels(alldry_finaltest$outcome_prediction)=="0"] <- "NonFIP"
+levels(alldry_finaltest$outcome_prediction)[levels(alldry_finaltest$outcome_prediction)=="1"] <- "FIP"
+
+# Split the partitions and create a predictor df and an outcome vector for each partition
+trainingData <- alldry_training
+trainingOutcome <- alldry_training$outcome_prediction
+
+validationData <- select(alldry_validation, -outcome_prediction)
+validationOutcome <- alldry_validation$outcome_prediction       
+
+finaltestData <- select(alldry_finaltest, -outcome_prediction)
+finaltestOutcome <- alldry_finaltest$outcome_prediction 
+
+```
+
+```{r functions_baseModels, echo=FALSE, error=FALSE, message=FALSE, include = FALSE, warning=FALSE, results='asis', fig.height=7, fig.width=10, fig.align="center"}
+
+# Prepare base model functions
+modelLr <- function(X, Y, Z){
+  
+      set.seed(Z)  # no tuning parameters for log reg model, could refine the variable in model?
+
+      LrControl <- trainControl(method = "cv",
+                          number = 10, 
+                          repeats = 10,
+                          savePredictions = T,
+                          classProbs = T)  
+
+                    caretList(X,
+                          as.factor(Y),
+                          tuneList = list(mix = caretModelSpec(method = "glm", 
+                                                               preProcess = c("center", "scale"))),
+                                                               trControl = LrControl)
+}
+
+modelNbTune <- function(X, Y, Z){
+  
+      set.seed(Z)
+  
+      NbControl <- trainControl(method = "cv",
+                          number = 10,
+                          repeats = 10,
+                          savePredictions = T,
+                          classProbs = T)
+      
+                      caretList(X,
+                          as.factor(Y),
+                          tuneList = list(mix = caretModelSpec(method = "naive_bayes", 
+                                                               preProcess = c("center", "scale"), 
+                                                               tuneGrid = expand.grid(laplace = 0, 
+                                                                                    usekernel = c(T, F), 
+                                                                                    adjust = c(0,0.25,0.5,0.75,1.0)))),
+                                                               trControl = NbControl)
+}
+
+modelSvmTune <- function(X, Y, Z){
+  
+      set.seed(Z)
+
+      svmControl <- trainControl(method = "cv",
+                                 number = 10, 
+                                 repeats = 10,
+                                 savePredictions = T,
+                                 classProbs = T)
+
+                      caretList(X,
+                          as.factor(Y),
+                          tuneList = list(mix = caretModelSpec(method="svmLinear2", 
+                                                               preProcess = c("center", "scale"), 
+                                                               tuneGrid = expand.grid(cost = c(0,0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2,5)))),
+                                                               trControl = svmControl)
+}
+
+modelRfTune <- function(X, Y, Z){
+  
+    set.seed(Z)
+  
+    rfControl <- trainControl(method = "cv",
+                             number = 10,
+                             repeats = 10,
+                             search = "random",
+                             savePredictions = T,
+                             classProbs = T)
+    
+                      caretList(X,
+                          as.factor(Y),
+                          tuneList = list(mix = caretModelSpec(method = "rf", 
+                                                               preProcess = c("center", "scale"), 
+                                                               tuneLength = 20)),
+                                                               trControl = rfControl, 
+                                                               importance=T)
+}
+                      
+# Generate list of models to be built                      
+modelTune_list <- list(randFor = modelRfTune, suppVm = modelSvmTune, naiveB = modelNbTune, logReg = modelLr) %>% enframe(name = "modelName", value = "model")
+
+```
+
+```{r build_baseModels, echo=FALSE, error=FALSE, message=FALSE, include = FALSE, warning=FALSE, results='asis', fig.height=7, fig.width=10, fig.align="center"}
+
+#Set seed for generation of random seeds, same seeds will be used for training the models in the mixed ensemble
+set.seed(14)
+randSeedList <- as.integer(seq(from = round(runif(1, 1, 31245), digits = 1), to = 99789, length.out = 100))
+
+# Create df for training data to be stored
+train_mix_df <- data.frame(iteration = NA, randSeed = NA, train.x = NA, train.y = NA, modelFits = NA)
+train_mix_df <- train_mix_df[-1,]
+
+# Progress bar for training progression - for monitoring only
+pb <- txtProgressBar(min = 0, max = 100, style = 3)
+noModels <- 100
+system.time(
+for (i in 1:noModels) {
+       j <- i
+       train_mix_df[i,1] <- i
+       train_mix_df[i,2] <- as.integer(randSeedList[i])
+       randSeed <- train_mix_df$randSeed[i]
+       set.seed(randSeed)
+       traindSMix <<- downSample(trainingData, trainingData$outcome_prediction)
+
+       train.x <- as.data.frame(select(traindSMix, -outcome_prediction, -Class))
+       train.y <- traindSMix["outcome_prediction"]
+       rm(traindSMix)
+
+       train_mix_df[i,3] <- nest(train.x)
+       train_mix_df[i,4] <- nest(train.y)
+       
+       setTxtProgressBar(pb, i)
+ }
+)
+
+# Create the nested validation data
+for (rn in 1:100) {
+  valid.x <- as.data.frame(select(alldry_validation, -outcome_prediction))
+  train_mix_df[rn,5] <- nest(valid.x)
+  valid.y <- as.data.frame(select(alldry_validation, outcome_prediction))
+  train_mix_df[rn,6] <- nest(valid.y)
+}
+
+names(train_mix_df)[5] <- "valid.x"
+names(train_mix_df)[6] <- "valid.y"
+
+train_mix_df %<>% bind_cols(modelTune_list[rep(1:nrow(modelTune_list), nrow(train_mix_df)/4),] %>% arrange(modelName))
+
+train_mix_df %<>% mutate(params = map2(train.x, train.y, ~list(X = .x, Y = .y$outcome_prediction)))
+
+## Train the final model
+future::plan(multiprocess)
+system.time(train_mix_df %<>% mutate(modelFits = future_invoke_map(model, params, Z = randSeed)))
+
+```
+
+```{r build_mixEnsemble, echo=FALSE, error=FALSE, message=FALSE, include = FALSE, warning=FALSE, results='asis', fig.height=7, fig.width=10, fig.align="center"}
+
+# Process sequentially rather than parallel
+registerDoSEQ()
+
+# Create blank vector for model fits required for caretStack
+allModelsMix <- c()
+
+# Use length of train_mix_df$modelFits for iterator
+for (i in 1:100) {
+
+  train_tempmix <- train_mix_df$modelFits[[i]]
+  allModelsMix <- append(allModelsMix, (train_tempmix))
+
+}
+
+# Rename models in model list
+names(allModelsMix) <- paste0('Mix', seq_along(allModelsMix))  # naming fixed here
+
+# Build caretStack ensemble, grid forced to Mtry between 40 and 50, to ensure a representative selection of base learners were evaluated
+set.seed(20758)
+rfEnsembStackMix <- caretStack(allModelsMix, method='rf', 
+                               trControl=trainControl(method='cv'), 
+                               tuneGrid=expand.grid(mtry=seq(40, 50, by =1)))
+
+# Report ensemble model results
+rfEnsembStackMix
+
+```
+
+```{r ensemble_predictions, echo=FALSE, error=FALSE, fig.align="center", fig.height=7, fig.width=10, message=FALSE, warning=FALSE, include=TRUE, results='asis'}
+
+# Predict validation data on the ensemble
+validationPredictStackM <- predict(rfEnsembStackMix, validationData)
+# Return results 
+validationPredictStackM
+# Run confusion matrix for validation data on ensemble
+confusionMatrix(validationPredictStackM, alldry_validation$outcome_prediction, positive = "FIP")
+
+# Predict finaltest data on the ensemble
+finaltestPredictStackM <- predict(rfEnsembStackMix, finaltestData)
+# Return results 
+finaltestPredictStackM
+# Run confusion matrix for finaltest data on ensemble
+confusionMatrix(finaltestPredictStackM, alldry_finaltest$outcome_prediction, positive = "FIP")
+
+# Predict confirmed cases data on the ensemble
+confirmedPredictStackM <- predict(rfEnsembStackMix, confirmedCasesEns)
+# Return results 
+confirmedPredictStackM
+# Run confusion matrix for confirmed cases on ensemble
+confusionMatrix(confirmedPredictStackM, confirmedCases$outcome_prediction, positive = "FIP")
+
+```
