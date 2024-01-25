@@ -1,7 +1,7 @@
 # Dunbar_FIP_NonEffusive_ML
 Code to accompany the publication "A machine learning approach to diagnosing feline infectious peritonitis, a fatal coronavirus infection of cats" in R markdown format.
 
-Title: A machine learning approach to diagnosing feline infectious peritonitis, a fatal coronavirus infection of cats
+Title: Assessing the feasibility of applying machine learning to diagnosing non-effusive feline infectious peritonitis
 
 Authors and Affiliations: Dawn Dunbar a, Simon A. Babayan b, Sarah Krumrie a, Hayley Haining a, Margaret Hosie c and William Weir a a School of Veterinary Medicine, University of Glasgow, Glasgow, United Kingdom b Institute of Biodiversity, Animal Health and Comparative Medicine, University of Glasgow, Glasgow, United Kingdom c MRC-University of Glasgow Centre for Virus Research, Glasgow, United Kingdom
 
